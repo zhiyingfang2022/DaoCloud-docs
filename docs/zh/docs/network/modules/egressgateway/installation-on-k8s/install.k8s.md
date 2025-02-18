@@ -1,6 +1,16 @@
-# 使用 Egress Policy
+# 自建集群安装 EgressGateway
 
-## 目前 EgressGateway 支持如下 CNI
+## 介绍
+
+本文将演示在一个自建集群上快速安装 EgressGateway。
+
+## 要求
+
+1. 已经具备一个自建好的 Kubernetes 集群，至少有 2 个节点。
+
+2. 集群准备好 helm 工具。
+
+3. 目前 EgressGateway 支持如下 CNI。
 
 ===  "Calico"
 
@@ -10,6 +20,7 @@
     # set chainInsertMode
     $ kubectl patch felixconfigurations  default --type='merge' -p '{"spec":{"chainInsertMode":"Append"}}'
     
+      
     # check status
     $ kubectl get FelixConfiguration default -o yaml
       apiVersion: crd.projectcalico.org/v1
@@ -40,28 +51,70 @@
 
     将集群外的服务地址添加到 spiderpool.spidercoordinators 的 'default' 对象的 'hijackCIDR' 中，使 Pod 访问这些外部服务时，流量先经过 Pod 所在的主机，从而被 EgressGateway 规则匹配。
 
-    假如 "1.1.1.1/32", "2.2.2.2/32" 为外部服务地址。对于已经运行的 Pod，需要重启 Pod，这些路由规则才会在 Pod 中生效。
-
-    ```shell
+    ```
+    # "1.1.1.1/32", "2.2.2.2/32" 为外部服务地址。对于已经运行的 Pod，需要重启 Pod，这些路由规则才会在 Pod 中生效。
     kubectl patch spidercoordinators default  --type='merge' -p '{"spec": {"hijackCIDR": ["1.1.1.1/32", "2.2.2.2/32"]}}'
     ```
 
-## 确认 EgressGateway 运行正常
+=== "Cilium"
 
-确认所有的 EgressGateway Pod 运行正常。
+    当前 EgressGateway 仅支持 Cilium `Native` 路由模式. 
+    
+    如果你想在你的集群中运行 [Cilium](https://cilium.io/)，你可以参考下面命令：
+
+    ```shell
+    cilium install --wait --set enable-ipv4=true \
+        --set ipv4NativeRoutingCIDR=$IPV4_POD_CIDR \
+        --set autoDirectNodeRoutes=true \
+        --set routingMode="native" \
+        --set bpf.masquerade=false
+    ```
+    
+    如果你在 AWS 中使用，你可以参考[这篇](/usage/AwsWithCilium)文章。
+
+## 安装 EgressGateway
+
+### 添加 EgressGateway 仓库
 
 ```shell
-$ kubectl get pod -n kube-system | grep egressgateway
-egressgateway-agent-29lt5                  1/1     Running   0          9h
-egressgateway-agent-94n8k                  1/1     Running   0          9h
-egressgateway-agent-klkhf                  1/1     Running   0          9h
-egressgateway-controller-5754f6658-7pn4z   1/1     Running   0          9h
+helm repo add egressgateway https://spidernet-io.github.io/egressgateway/
+helm repo update
 ```
+
+### 安装 EgressGateway
+
+1. 可使用如下命令快速安装 EgressGateway
+
+    ```shell
+    helm install egressgateway egressgateway/egressgateway \
+		  -n kube-system \
+			--set feature.tunnelIpv4Subnet="192.200.0.1/16" \
+			--wait --debug
+    ```
+
+    在安装命令中，有如下注意点：
+
+    * 安装命令中，需要提供用于 EgressGateway 隧道节点的 IPv4 和 IPv6 网段，要求该网段和集群内的其他地址不冲突。
+    * 可使用选项 `--set feature.tunnelDetectMethod="interface=eth0"` 来定制 EgressGateway 隧道的承载网卡，否则，默认使用默认路由的网卡。
+    * 如果希望使用 IPv6 ，可使用选项 `--set feature.enableIPv6=true` 开启，并设置 `feature.tunnelIpv6Subnet`。
+    * EgressGateway Controller 支持高可用，可通过 `--set controller.replicas=2` 设置。
+    * 开启网关节点上的返回路由规则，可通过设置 `--set feature.enableGatewayReplyRoute=true` 开启，如果要搭配 Spiderpool 支持 underlay CNI，则必须开启该选项。
+
+2. 确认所有的 EgressGateway Pod 运行正常。
+
+    ```shell
+    $ kubectl get pod -n kube-system | grep egressgateway
+    egressgateway-agent-29lt5                  1/1     Running   0          9h
+    egressgateway-agent-94n8k                  1/1     Running   0          9h
+    egressgateway-agent-klkhf                  1/1     Running   0          9h
+    egressgateway-controller-5754f6658-7pn4z   1/1     Running   0          9h
+    ```
+
+3. 任何功能配置，可通过调整 EgressGateway 应用的 Helm Values 来实现。
 
 ## 创建 EgressGateway 实例
 
-1. EgressGateway 定义了一组节点作为集群的出口网关，集群内的 egress 流量将会通过这组节点转发而出集群。
-   因此，我们需要预先定义一组 EgressGateway，例子如下：
+1. EgressGateway 定义了一组节点作为集群的出口网关，集群内的 egress 流量将会通过这组节点转发而出集群。因此，我们需要预先定义一组 EgressGateway，例子如下：
 
     ```shell
     cat <<EOF | kubectl apply -f -
@@ -136,7 +189,7 @@ egressgateway-controller-5754f6658-7pn4z   1/1     Running   0          9h
 
     EgressPolicy 实例用于定义哪些 Pod 的出口流量要经过 EgressGateway 节点转发，以及其它的配置细节。
     可创建如下例子，当匹配的 Pod 访问任意集群外部的地址（任意不是 Node IP、CNI Pod CIDR、ClusterIP 的地址）时，都会被 EgressGateway Node 转发。注意的是，
-    EgressPolicy 对象是租户级别的，因此它务必创建在 selected 应用的租户下。
+    EgressPolicy 对象是租户级别的，因此，它务必创建在 selected 应用的租户下
 
     ```shell
     cat <<EOF | kubectl apply -f -
@@ -217,6 +270,7 @@ egressgateway-controller-5754f6658-7pn4z   1/1     Running   0          9h
       namespace: default
     ```
 
+
 ## 测试效果
 
 1. 可在集群外部署应用 nettools，用于模拟一个集群外部的服务，nettools 会在 http 回复中返回请求者的源 IP 地址。
@@ -226,7 +280,6 @@ egressgateway-controller-5754f6658-7pn4z   1/1     Running   0          9h
     ```
 
 2. 在集群内部的 visitor Pod 中，验证出口流量的效果，我们可以看到 visitor 访问外部服务，nettools 返回的源 IP 符合了 EgressPolicy `.status.eip` 的效果。
-
     ```shell
     $ kubectl get pod
     NAME                       READY   STATUS    RESTARTS   AGE
